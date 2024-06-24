@@ -1,16 +1,23 @@
 import argparse
 import os
-import platform
-import warnings
-
+from fastapi import FastAPI, Request
 import torch
-from accelerate import init_empty_weights, load_checkpoint_and_dispatch
+import warnings
+import uvicorn, json, datetime
+import uuid
+
 from huggingface_hub import snapshot_download
 from transformers.generation.utils import logger
+from accelerate import init_empty_weights, load_checkpoint_and_dispatch
+try:
+    from transformers import MossForCausalLM, MossTokenizer
+except (ImportError, ModuleNotFoundError):
+    from models.modeling_moss import MossForCausalLM
+    from models.tokenization_moss import MossTokenizer
+    from models.configuration_moss import MossConfig
 
-from models.configuration_moss import MossConfig
-from models.modeling_moss import MossForCausalLM
-from models.tokenization_moss import MossTokenizer
+logger.setLevel("ERROR")
+warnings.filterwarnings("ignore")
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_name", default="fnlp/moss-moon-003-sft-int4", 
@@ -19,22 +26,20 @@ parser.add_argument("--model_name", default="fnlp/moss-moon-003-sft-int4",
                              "fnlp/moss-moon-003-sft-int4"], type=str)
 parser.add_argument("--gpu", default="0", type=str)
 args = parser.parse_args()
-
 os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 num_gpus = len(args.gpu.split(","))
 
 if args.model_name in ["fnlp/moss-moon-003-sft-int8", "fnlp/moss-moon-003-sft-int4"] and num_gpus > 1:
     raise ValueError("Quantized models do not support model parallel. Please run on a single GPU (e.g., --gpu 0) or use `fnlp/moss-moon-003-sft`")
 
-logger.setLevel("ERROR")
-warnings.filterwarnings("ignore")
-
 model_path = args.model_name
-if not os.path.exists(args.model_name):
-    model_path = snapshot_download(args.model_name)
+if not os.path.exists(model_path):
+    model_path = snapshot_download(model_path)
+print(model_path)
 
 config = MossConfig.from_pretrained(model_path)
 tokenizer = MossTokenizer.from_pretrained(model_path)
+
 if num_gpus > 1:  
     print("Waiting for all devices to be ready, it may take a few minutes...")
     with init_empty_weights():
@@ -46,12 +51,9 @@ if num_gpus > 1:
 else: # on a single gpu
     model = MossForCausalLM.from_pretrained(model_path).half().cuda()
 
+app = FastAPI()
 
-def clear():
-    os.system('cls' if platform.system() == 'Windows' else 'clear')
-    
-def main():
-    meta_instruction = \
+meta_instruction = \
     """You are an AI assistant whose name is MOSS.
     - MOSS is a conversational language model that is developed by Fudan University. It is designed to be helpful, honest, and harmless.
     - MOSS can understand and communicate fluently in the language chosen by the user such as English and 中文. MOSS can perform any language-based tasks.
@@ -64,34 +66,54 @@ def main():
     Capabilities and tools that MOSS can possess.
     """
 
+history_mp = {} # restore history for every uid
+
+@app.post("/")
+async def create_item(request: Request):
     prompt = meta_instruction
-    print("欢迎使用 MOSS 人工智能助手！输入内容即可进行对话。输入 clear 以清空对话历史，输入 stop 以终止对话。")
-    while True:
-        query = input("<|Human|>: ")
-        if query.strip() == "stop":
-            break
-        if query.strip() == "clear":
-            clear()
-            prompt = meta_instruction
-            continue
-        prompt += '<|Human|>: ' + query + '<eoh>'
-        inputs = tokenizer(prompt, return_tensors="pt")
-        with torch.no_grad():
-            outputs = model.generate(
-                inputs.input_ids.cuda(), 
-                attention_mask=inputs.attention_mask.cuda(), 
-                max_length=2048, 
-                do_sample=True, 
-                top_k=40, 
-                top_p=0.8, 
-                temperature=0.7,
-                repetition_penalty=1.02,
-                num_return_sequences=1, 
-                eos_token_id=106068,
-                pad_token_id=tokenizer.pad_token_id)
-            response = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
-            prompt += response
-            print(response.lstrip('\n'))
+    json_post_raw = await request.json()
+    json_post = json.dumps(json_post_raw)
+    json_post_list = json.loads(json_post)
+    query = json_post_list.get('prompt') # '<|Human|>: ' + query + '<eoh>'
+    uid = json_post_list.get('uid', None)
+    if uid == None or not(uid in history_mp):
+        uid = str(uuid.uuid4())
+        history_mp[uid] = []
+    for i, (old_query, response) in enumerate(history_mp[uid]):
+        prompt += '<|Human|>: ' + old_query + '<eoh>'+response
+    prompt += '<|Human|>: ' + query + '<eoh>'
+    max_length = json_post_list.get('max_length', 2048)
+    top_p = json_post_list.get('top_p', 0.8)
+    temperature = json_post_list.get('temperature', 0.7)
+    inputs = tokenizer(prompt, return_tensors="pt")
+    now = datetime.datetime.now()
+    time = now.strftime("%Y-%m-%d %H:%M:%S")
+    inputs = tokenizer(prompt, return_tensors="pt")
+    with torch.no_grad():
+        outputs = model.generate(
+            inputs.input_ids.cuda(), 
+            attention_mask=inputs.attention_mask.cuda(), 
+            max_length=max_length, 
+            do_sample=True, 
+            top_k=40, 
+            top_p=top_p, 
+            temperature=temperature,
+            repetition_penalty=1.02,
+            num_return_sequences=1, 
+            eos_token_id=106068,
+            pad_token_id=tokenizer.pad_token_id)
+        response = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+    history_mp[uid] = history_mp[uid] + [(query, response)]
+    answer = {
+        "response": response,
+        "history": history_mp[uid],
+        "status": 200,
+        "time": time,
+        "uid": uid
+    }
+    log = "[" + time + "] " + '", prompt:"' + prompt + '", response:"' + repr(response) + '"'
+    print(log)
+    return answer
     
 if __name__ == "__main__":
-    main()
+    uvicorn.run(app, host='0.0.0.0', port=19324, workers=1)
